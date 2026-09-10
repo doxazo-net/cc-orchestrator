@@ -315,11 +315,12 @@ _steer_prefilter() {
 # command line (-F query=@file, --input, -f query="$Q") cannot be classified and is SILENT-ON-DOUBT.
 _steer_scan() {
   printf '%s' "$1" | LC_ALL=C awk -v FL="$_FLAGS" '
-    function flush(upto,   s) {
+    # qs(len): a run of len `Q`s, sliced from a cache grown by doubling. NOT gsub(/./,"Q",s): that
+    # is super-linear in BWK awk (a 2MB quoted argument took 37s through it; this path is linear).
+    function qs(len) { while (length(QQ) < len) QQ = QQ QQ; return substr(QQ, 1, len) }
+    function flush(upto) {
       if (upto <= seg) return
-      s = substr(T, seg, upto - seg)
-      if (masked) gsub(/./, "Q", s)
-      M = M s; seg = upto
+      M = M (masked ? qs(upto - seg) : substr(T, seg, upto - seg)); seg = upto
     }
     function setmode() { masked = (fc[d] ? 0 : 1) }
     function push(t, code, dl, rep) {
@@ -363,12 +364,12 @@ _steer_scan() {
       }
       nhd = 0
       e = (k - 1 <= n ? k - 1 : n + 1)
-      line = substr(T, seg, e - seg); gsub(/./, "Q", line); M = M line; seg = e
+      M = M qs(e - seg); seg = e
       return e
     }
     { T = (NR == 1 ? $0 : T "\n" $0) }
     END {
-      SQ = sprintf("%c", 39)
+      SQ = sprintf("%c", 39); QQ = "Q"
       gsub(/\\\n/, "", T)
       n = split(T, a, "")
       d = 1; ft[1] = "U"; fc[1] = 1; masked = 0; seg = 1; M = ""; cst = 1; ncl = 0; nhd = 0
