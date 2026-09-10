@@ -413,7 +413,11 @@ _steer_scan() {
       GQLM = "(--method[[:space:]=]+|-X[[:space:]=]*)(PATCH|PUT|DELETE)"
       RM = "(--method[[:space:]=]|-X[[:space:]=]?[A-Za-z])"
       RF = "(^|[[:space:]])(--(field|input|raw-field)[[:space:]=]|-[fF][[:space:]=]?[^[:space:]])"
-      PR = "(^|[^[:alnum:]_.-])gh" FL "[[:space:]]+pr" FL "[[:space:]]+(create|comment)([^[:alnum:]_-]|$)"
+      # Rule 3 runs over the WHOLE masked command (newlines count as whitespace, so `gh pr` NEWLINE
+      # `create` still warns as base did), so its flag groups must not swallow an UNQUOTED separator:
+      # PFL is _FLAGS with ; & | ( ) excluded from flag and value tokens (quoted ones are already Q).
+      PFL = "([[:space:]]+-[^[:space:];&|()]+([[:space:]]+[^-[:space:];&|()][^[:space:];&|()]*)?)*"
+      PR = "(^|[^[:alnum:]_.-])gh" PFL "[[:space:]]+pr" PFL "[[:space:]]+(create|comment)([^[:alnum:]_-]|$)"
       for (k = 1; k <= ncl; k++) {
         m = substr(M, cs[k], ce[k] - cs[k])
         if (m !~ GH || m !~ API) continue

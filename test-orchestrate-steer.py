@@ -188,9 +188,8 @@ def main():
         "gh pr view 5 --json state",                      # not `gh api`
         "echo hello",
     ]
-    # ACCEPTED LIMITATION (mirrors the guard's F30 prose false-positives): a command that QUOTES the
-    # literal `gh api -X ...` in an argument (e.g. `git commit -m "...gh api -X PATCH..."`) DOES trip
-    # the whole-line grep. Harmless here - it is a WARN (advisory, exit 0), recoverable by rewording.
+    # A command that QUOTES the literal `gh api -X ...` in an argument (e.g. `git commit -m "...gh api
+    # -X PATCH..."`) is now SILENT: the scanner masks quoted prose (pinned in SCAN_SILENT below).
     for c in SILENT_CMDS:
         rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
         check(f"non-mutation / wrapper / non-gh -> silent ({c[:42]})", rc_ok and silent_all)
@@ -304,6 +303,80 @@ def main():
     for c in GQL_SILENT:
         rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
         check(f"gh api graphql read -> silent ({c[:42]!r})", rc_ok and silent_all)
+
+    # ---- hostile-review round 2: every base-era nudge on a REAL mutation is restored ----------
+    # The first per-clause rewrite demanded `gh` at clause command position and split clauses
+    # quote-blind; each vector below went SILENT under it (or is one branch of the scanner that
+    # replaced it, pinned so a mutation of that branch goes red HERE, at its own assertion).
+    SCAN_WARN = [
+        # I1: rule 3 as a word sequence anywhere, not only at clause start
+        "URL=$(gh pr create --fill)",
+        'echo "$(gh pr create --fill)"',                       # $(...) inside "..." is code
+        "env FOO=1 gh pr create --fill",
+        "timeout 30 gh pr comment 5 -b hi",
+        "sudo gh pr create --fill",
+        "! gh pr create --fill",
+        "echo 5 | xargs -I{} gh pr comment {} -b hi",
+        "xargs gh pr comment 5 -b hi < f",
+        "sleep 1 & gh pr create --fill",                       # lone & separates
+        "bash -c 'gh pr create --fill'",                       # a -c script is code, not prose
+        "eval 'gh pr comment 5 -b hi'",
+        "gh pr\ncreate --fill",
+        "gh pr view 5 --json x\ngh pr create --fill",          # newline-separated second command
+        "(gh pr create --fill)",
+        "command gh pr create --fill",
+        "if x; then gh pr create --fill; fi",
+        "gh pr view 5; gh pr create --fill",                   # ; separator
+        "gh pr \\\n  create --fill",                           # backslash-newline join
+        "gh -R 'o/r' pr comment 5 -b x",                       # quoted flag value stays one token
+        # I2: rule 2 judged per REAL command (quote-aware split; newlines split outside quotes)
+        "gh api repos/o/r/issues -f title=hi\ngh api graphql -f query='{viewer{login}}'",
+        "gh api graphql -f query='{viewer{login}}'\ngh api repos/o/r/issues -f title=hi",
+        "gh api graphql -f query='{viewer{login}}'\ngh api -X POST repos/o/r/issues",
+        "gh api repos/o/r/issues/1/comments --jq '.[] | .id' -f body=x",
+        "gh api graphql --jq '.a | .b' -f query='mutation{x}'",
+        "gh api graphql -f query='{a}' & gh api repos/o/r/issues -f t=1",   # lone & splits rule 2
+        "gh api graphql -f query='{a}'; gh api repos/o/r/issues -f t=1",    # ; splits rule 2
+        "gh api 2>&1 repos/o/r/issues -f t=1",                 # >& is a redirect, not a separator
+        # graphql branches
+        "gh api graphql -X PATCH repos/o/r/issues/1",          # GraphQL never takes PATCH/PUT/DELETE
+        "gh api --paginate graphql -f query='mutation{x}'",    # flag groups between api and graphql
+        "gh api graphql -f query=$'mutation { x }'",           # M-c: ANSI-C quoted document
+        "gh api graphql -f query='fragment F on X { id } mutation { x { ...F } }'",
+        "gh api graphql -f query=@- <<'EOF'\nmutation {\n  x\n}\nEOF",   # heredoc body = the document
+    ]
+    for c in SCAN_WARN:
+        rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)
+        check(f"scanner: real mutation -> WARN, exit 0 ({c[:48]!r})", rc_ok and warned_all)
+
+    SCAN_SILENT = [
+        'echo "run gh pr create later"',                       # quoted prose
+        "git commit -m 'then gh pr create and gh api -X PATCH x'",
+        "gh-comment.sh 5 'see && gh pr create later'",         # a separator inside quotes never splits
+        "gh pr view 5 --json body --jq '.body' # then gh pr comment",   # comment is prose
+        "cat > notes.md <<'EOF'\nthen gh pr create\nEOF",      # heredoc body is prose
+        "gh pr view 5\necho create",
+        "gh api --paginate graphql -f query='{viewer{login}}'",
+        "gh api -H 'X-Github-Next-Global-ID: 1' graphql -f query='{viewer{login}}'",   # M-b
+        "gh api graphql -f query='mutationFoo'",               # mutation tail: a name, not the keyword
+        "gh api graphql -f query='query Mutations { viewer { login } }'",
+        "gh api graphql -f query='{a}' -f body=\"x mutation Foo y\"",
+        "gh pr view 5 --comments && gh pr list",
+    ]
+    for c in SCAN_SILENT:
+        rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
+        check(f"scanner: read / prose -> silent ({c[:48]!r})", rc_ok and silent_all)
+
+    # PERF: a long read chain never reaches awk (the prefilter), and one that does (every clause
+    # carries `comment`) is scanned in ONE pass, not one fork per clause.
+    for label, c in (
+            ("300-clause read chain", " && ".join(f"gh pr view {i} --json title" for i in range(300))),
+            ("300-clause prefilter-hit chain",
+             " && ".join(f"gh pr view {i} --comments" for i in range(300)))):
+        t0 = time.time()
+        rc, err = run_steer({"command": c}, channel="stdin")
+        check(f"perf: {label} scans in < 1s, silent, exit 0 ({time.time() - t0:.2f}s)",
+              rc == 0 and not warned(err) and time.time() - t0 < 1.0)
 
     # ---- Rule 4: read-dedup advisory WARN (marker-independent, #226) ----
     # A 2nd+ Read of a path already read THIS session with UNCHANGED mtime/size warns; the first
