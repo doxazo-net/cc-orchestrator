@@ -362,6 +362,10 @@ def main():
         "gh api graphql -f query='query Mutations { viewer { login } }'",
         "gh api graphql -f query='{a}' -f body=\"x mutation Foo y\"",
         "gh pr view 5 --comments && gh pr list",
+        # flag groups never span an UNQUOTED separator (a flag value glued to `|`/`;`, then the
+        # coreutils `pr` command): the pr-rule's flag tokens exclude ; & | ( )
+        "gh --version -R o/r| pr create.txt",
+        "gh -R o/r; pr comment.txt",
     ]
     for c in SCAN_SILENT:
         rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)

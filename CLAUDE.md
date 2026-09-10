@@ -70,13 +70,17 @@ Runtime (`scripts/`; canonical source is this repo):
   `reply-comment.sh`, ...) and `commands/*.md` - they are canonical-source by the same argument as the
   guard, and their omission made a mid-run `safe-push.sh` edit SILENT (the #283 miss). Matched under a
   `scripts/`/`commands/` PARENT so a same-named file elsewhere is not swallowed;
-  (2) a raw `gh api` mutation not via a `gh-*` wrapper -> use the wrapper (per shell clause; a
-  `gh api graphql` call warns only when its query document is a `mutation` operation, so GraphQL
-  READS are silent, and a document not on the line - `-F query=@file` - is silent-on-doubt);
+  (2) a raw `gh api` mutation not via a `gh-*` wrapper -> use the wrapper (per shell clause, split by
+  ONE quote-aware awk scan so a separator inside quotes never splits a call; REST keeps the base
+  -X/-f/-F/--field/--input test; a `gh api graphql` call warns only when its query document is a
+  `mutation` operation, so GraphQL READS are silent, and a document not on the line - `-F
+  query=@file`, `--input`, `-f query="$Q"` - is silent-on-doubt);
   (3) a raw `gh pr comment`/`gh pr create` -> canonical path (reply-comment.sh/gh-comment.sh; /prep-pr)
   (#159; canonical-steering only - `merge` and the allow-listed lifecycle subcommands are NOT flagged;
-  matched as a real INVOCATION per clause - gh at command position, create/comment as the next word
-  after `pr` and its flags - so a gh pr READ with a stray `create`/`comment` word is silent);
+  matched as a `gh [flags] pr [flags] create|comment` word sequence ANYWHERE in the command's code, so
+  `sudo`/`env`/`timeout`/`xargs`/`$(...)`/`bash -c` shapes warn, while a gh pr READ with a stray
+  `create`/`comment` word and quoted prose/heredoc bodies/comments are silent). A fork-free prefilter
+  keeps commands with no gh api/pr shape at base cost;
   (4) a redundant re-`Read` of a path already read this session with unchanged mtime+size -> skip the
   Read (#226; stateful per-session state keyed on the stdin `session_id`, marker-independent, advisory
   so the post-compaction re-read exception stays valid);

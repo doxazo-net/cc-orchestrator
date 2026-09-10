@@ -24,12 +24,14 @@
 #       Gated OFF
 #       for a `Read` tool call (a Read carries a file_path too) so wiring the hook for Read never
 #       turns reading a canonical file into a spurious "do not edit" nag.
-#   (2) RAW GH-API MUTATION -> WRAPPER: a shell clause invoking `gh api` NOT via a gh-* wrapper,
-#       with a REST mutation flag (-X/--method, -f/-F/--field/--raw-field/--input) or, for `gh api
-#       graphql`, a query document that is a `mutation` operation (a GraphQL READ is silent) -> WARN:
-#       use the gh-* wrapper. Marker-independent (steer every session).
-#   (3) RAW GH PR comment/create -> CANONICAL PATH: a clause that IS a `gh pr comment`/`gh pr create`
-#       invocation (gh at command position, subcommand as the next non-flag word after `pr`) -> WARN
+#   (2) RAW GH-API MUTATION -> WRAPPER: a shell clause (split quote-aware, see _steer_scan) invoking
+#       `gh api` NOT via a gh-* wrapper, with a REST mutation flag (-X/--method, -f/-F/--field/
+#       --raw-field/--input; same test as before 0.97.2) or, for `gh api graphql`, a query document
+#       that is a `mutation` operation (a GraphQL READ is silent; a document not on the line is
+#       silent-on-doubt) -> WARN: use the gh-* wrapper. Marker-independent (steer every session).
+#   (3) RAW GH PR comment/create -> CANONICAL PATH: a `gh [flags] pr [flags] create|comment` word
+#       sequence ANYWHERE in the command's code (not only at clause start, so sudo/env/timeout/xargs/
+#       $(...)/bash -c shapes warn), with quoted prose, heredoc bodies and comments masked -> WARN
 #       toward reply-comment.sh/gh-comment.sh / /prep-pr. Reads never warn. Marker-independent (#159).
 #   (4) REDUNDANT RE-READ -> WARN (#226): a 2nd+ `Read` of a path already read THIS session with an
 #       unchanged mtime+size -> WARN: the content is already in context, skip the Read. Stateful
