@@ -238,13 +238,72 @@ def main():
         rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
         check(f"gh pr rule: wrapper-alone stays silent ({c[:42]})", rc_ok and silent_all)
 
-    # ACCEPTED FALSE-POSITIVE (mirrors the gh-api F30 class): a gh pr READ compounded with a
-    # standalone `create`/`comment` word in an arg trips the whole-line grep. Harmless - advisory
-    # WARN, exit 0, reword to silence. Asserted so the behavior stays intentional, not a surprise.
-    rc_ok, warned_all, _ = both_channels(
-        {"command": "gh pr list && echo create the changelog"}, marker_active=False)
-    check("accepted FP: gh pr read + standalone 'create' word -> WARN (documented)",
-          rc_ok and warned_all)
+    # ---- Rule 3 per-clause invocation matching (the maintainer rejected the old "accepted" FP) ----
+    # The old matcher grepped the WHOLE line for gh / pr / comment|create independently, so any gh pr
+    # READ plus a stray `create`/`comment` word anywhere warned. It now requires a real invocation:
+    # gh at clause command position, `pr`, optional flag groups, then create/comment as the next word.
+    GH_PR_INVOCATION_WARN = [
+        "gh pr create --fill",
+        "gh pr comment 5 -b hi",
+        "gh -R o/r pr create --title t --body b",
+        "gh pr --repo o/r comment 5 -b x",
+        "cd x && gh pr create --title t --body b",
+        "gh pr list --state open && gh pr create --fill",
+        "GH_REPO=o/r gh pr create --fill",
+        "/opt/homebrew/bin/gh pr comment 5 -b hi",
+        "gh pr view 5\ngh pr comment 5 -b hi",           # newline-separated second command
+    ]
+    for c in GH_PR_INVOCATION_WARN:
+        rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)
+        check(f"gh pr invocation -> WARN, exit 0 ({c[:42]!r})", rc_ok and warned_all)
+
+    GH_PR_READ_SILENT = [
+        "gh pr view 943 && echo create",
+        "gh pr view 945 --comments",
+        "gh pr view 7 --json body --jq .body | grep -n create",
+        'gh pr list --search "create"',
+        "gh pr diff 5",
+        "gh pr checks 5",
+        "reply-comment.sh 5 123 'x'",
+        "gh pr list && echo create the changelog",       # was the documented "accepted FP"
+        "gh pr view 5 --json title; echo comment",
+        "gh pr view 5 --json comments || echo comment failed",
+    ]
+    for c in GH_PR_READ_SILENT:
+        rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
+        check(f"gh pr read / non-invocation -> silent ({c[:42]!r})", rc_ok and silent_all)
+
+    # ---- Rule 2 GraphQL: only a `mutation` operation warns; reads are silent ----
+    GQL_WARN = [
+        "gh api graphql -f query='mutation{resolveReviewThread(input:{threadId:\"T\"}){thread{id}}}'",
+        "gh api graphql -f query='mutation R($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}' -F id=T",
+        "gh api graphql -f query=mutation{x}",
+        'gh api graphql -f query="mutation { addReaction(input:{}) { reaction { content } } }"',
+        "gh api graphql -f query='\n  mutation {\n    x\n  }\n'",   # multi-line document
+        "gh api graphql --raw-field query='mutation M { x }'",
+        "gh api graphql -fquery='mutation{x}'",
+        # a REST mutation in ANOTHER clause of a compound with a GraphQL read still warns
+        "gh api graphql -f query='{viewer{login}}' && gh api repos/o/r/issues -f title=hi",
+        "gh api graphql -f query='{viewer{login}}' && gh api -X PATCH repos/o/r/issues/1",
+    ]
+    for c in GQL_WARN:
+        rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)
+        check(f"gh api graphql mutation -> WARN, exit 0 ({c[:42]!r})", rc_ok and warned_all)
+
+    GQL_SILENT = [
+        "gh api graphql -f query='{repository(owner:\"o\",name:\"r\"){pullRequest(number:5){id}}}'",
+        "gh api graphql -f query='query { viewer { login } }'",
+        "gh api graphql -f query='query Threads($n:Int!){repository(owner:\"o\",name:\"r\"){pullRequest(number:$n){reviewThreads(first:50){nodes{isResolved}}}}}' -F n=5",
+        "gh api graphql -f query='\n  query {\n    viewer { login }\n  }\n'",
+        "gh api graphql -f query='{viewer{login}}' --jq .data.viewer.login",
+        "gh api graphql -f query='{repository(owner:\"o\",name:\"r\"){mutationCount: id}}'",
+        # SILENT-ON-DOUBT: the document is not on the command line, so it cannot be classified.
+        "gh api graphql -F query=@threads.graphql -F n=5",
+        "gh api graphql --input payload.json",
+    ]
+    for c in GQL_SILENT:
+        rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
+        check(f"gh api graphql read -> silent ({c[:42]!r})", rc_ok and silent_all)
 
     # ---- Rule 4: read-dedup advisory WARN (marker-independent, #226) ----
     # A 2nd+ Read of a path already read THIS session with UNCHANGED mtime/size warns; the first

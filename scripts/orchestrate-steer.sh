@@ -24,11 +24,13 @@
 #       Gated OFF
 #       for a `Read` tool call (a Read carries a file_path too) so wiring the hook for Read never
 #       turns reading a canonical file into a spurious "do not edit" nag.
-#   (2) RAW GH-API MUTATION -> WRAPPER: a Bash command invoking `gh api` with a MUTATION flag
-#       (-X/--method, -f/-F/--field/--raw-field/--input) directly on the command line and NOT via a
-#       gh-* wrapper script -> WARN: use the gh-* wrapper. Marker-independent (steer every session).
-#   (3) RAW GH PR comment/create -> CANONICAL PATH: `gh pr comment`/`gh pr create` on the command
-#       line -> WARN toward reply-comment.sh/gh-comment.sh / /prep-pr. Marker-independent (#159).
+#   (2) RAW GH-API MUTATION -> WRAPPER: a shell clause invoking `gh api` NOT via a gh-* wrapper,
+#       with a REST mutation flag (-X/--method, -f/-F/--field/--raw-field/--input) or, for `gh api
+#       graphql`, a query document that is a `mutation` operation (a GraphQL READ is silent) -> WARN:
+#       use the gh-* wrapper. Marker-independent (steer every session).
+#   (3) RAW GH PR comment/create -> CANONICAL PATH: a clause that IS a `gh pr comment`/`gh pr create`
+#       invocation (gh at command position, subcommand as the next non-flag word after `pr`) -> WARN
+#       toward reply-comment.sh/gh-comment.sh / /prep-pr. Reads never warn. Marker-independent (#159).
 #   (4) REDUNDANT RE-READ -> WARN (#226): a 2nd+ `Read` of a path already read THIS session with an
 #       unchanged mtime+size -> WARN: the content is already in context, skip the Read. Stateful
 #       (per-session, keyed on the stdin session_id), marker-independent, advisory only. The valid
@@ -79,6 +81,16 @@ if [ "${1:-}" = "--self-test" ]; then
     { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
       || st_fail="gh-pr rule (create) (rc=$st_rc out=$st_out)"
   fi
+  # (2r)/(3r) the two READ shapes that used to false-positive must stay SILENT at exit 0: a GraphQL
+  # read, and a gh pr read compounded with a standalone `create` word.
+  for st_cmd in "gh api graphql -f query='{viewer{login}}'" "gh pr view 943 && echo create"; do
+    [ -n "$st_fail" ] && break
+    st_payload=$(jq -cn --arg c "$st_cmd" '{tool_name:"Bash",tool_input:{command:$c}}' 2>/dev/null) \
+      || { st_fail="read-silence (jq unavailable)"; break; }
+    st_out=$(printf '%s' "$st_payload" | "$0" 2>&1); st_rc=$?
+    { [ "$st_rc" -eq 0 ] && ! printf '%s' "$st_out" | grep -q 'STEER'; } \
+      || st_fail="read-silence '$st_cmd' (rc=$st_rc out=$st_out)"
+  done
   # (4) read-dedup: a 2nd Read of an unchanged path (same session) must WARN at exit 0; the 1st is
   # silent. Uses an isolated temp state dir + file so the self-test never touches real read state.
   if [ -z "$st_fail" ]; then
@@ -104,7 +116,7 @@ if [ "${1:-}" = "--self-test" ]; then
     fi
   fi
   if [ -z "$st_fail" ]; then
-    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations + read-dedup warned, exit 0)"
+    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations + read-dedup warned, graphql read + gh pr read silent, exit 0)"
     exit 0
   fi
   echo "orchestrate-steer self-test FAIL: expected a STEER warn at exit 0, got $st_fail" >&2
@@ -239,19 +251,79 @@ is_foreground_agent() {
   printf '%s' "$1" | jq -e '.run_in_background == false' >/dev/null 2>&1
 }
 
-# A raw `gh api` MUTATION on the command line, NOT routed through a gh-* wrapper. Requires the `gh`
-# word, the `api` subcommand, and a mutation flag. A wrapper-ALONE invocation (e.g. `gh-comment.sh
-# 5 hi`) is already silent because the bare-`gh` check requires `gh` followed by space/EOL, and the
-# char after `gh` in `gh-comment.sh` is `-`, not a boundary - so no global gh-*.sh exemption is
-# needed (and a blanket exemption is WRONG: in a compound `gh-comment.sh ... && gh api -X PATCH ...`
-# a bare `gh api` mutation IS present and must still warn).
-# Separator-tolerant (space/=/glued), mirroring the guard's is_merge_api flag matching.
-is_raw_gh_api_mutation() {
+# --- shared clause machinery for the command rules (2) and (3) --------------
+# Both rules used to grep the WHOLE command line for independent words, so a gh READ compounded with
+# an unrelated word (`gh pr view 943 && echo create`) or any GraphQL read (`gh api graphql -f
+# query='{...}'`) drew a nudge. The maintainer rejected those as "accepted" false positives. Each rule
+# now judges ONE shell clause at a time, mirroring orchestrate-guard.sh's per-clause loop: backslash-
+# newline continuations are joined first, then && || ; | each start a new clause.
+#
+# _INTRO and _FLAGS are copied VERBATIM from orchestrate-guard.sh (its `_INTRO` and the flag-group
+# regex inside `is_pr_merge`), so the steer and the floor agree on what "command position" and "flag
+# groups between gh words" mean. _FLAGS = zero or more `-flag [value]` groups, where a value is a
+# token that does not itself start with `-`.
+_INTRO='([({][[:space:]]*|[^[:space:]]*[<>][^[:space:]]*[[:space:]]+|(command|nohup|time|eval|exec|then|do|else)[[:space:]]+)*'
+_FLAGS='([[:space:]]+-[^[:space:]]+([[:space:]]+[^-[:space:]][^[:space:]]*)?)*'
+
+# Emit the clauses of $1, each terminated by \036 (ASCII RS), so a clause may keep embedded NEWLINES.
+# $2 = "nl" also treats a bare newline as a clause separator (the guard's behavior, used by rule 3);
+# anything else keeps newlines inside the clause (rule 2, so a multi-line GraphQL document stays in
+# the clause of the `gh api graphql` that carries it). Over-splitting only ever REDUCES nudges.
+_clauses() {
+  printf '%s' "$1" | awk -v nl="${2:-}" '
+    { rec = (NR==1 ? $0 : rec "\n" $0) }
+    END {
+      gsub(/\\\n/, "", rec)
+      gsub(/&&|[|][|]|;|[|]/, "\036", rec)
+      if (nl == "nl") gsub(/\n/, "\036", rec)
+      printf "%s\036", rec
+    }'
+}
+
+# ONE clause, is it a raw REST `gh api` mutation or a GraphQL mutation? (helper for rule 2)
+_is_api_mutation_clause() {
   local c="$1"
   printf '%s' "$c" | grep -Eq '(^|[^[:alnum:]_-])gh([[:space:]]|$)' || return 1
   printf '%s' "$c" | grep -Eq '(^|[[:space:]])api([[:space:]]|$)' || return 1
+  # GraphQL: `api` followed (after optional flag groups) by the `graphql` endpoint. Every GraphQL
+  # call is a POST carrying a `-f query=...` field, so the REST flag test below would call EVERY read
+  # a mutation. The operation type decides instead: warn only when the document is a `mutation`
+  # operation - the keyword right after `query=` (optionally quoted), or at the start of a line of a
+  # multi-line document - followed by `{`, `(`, a name, or end of line. A read (`{...}` shorthand, or
+  # `query Name {...}`) is SILENT. Also warn on -X PATCH/PUT/DELETE in the clause: GraphQL never takes
+  # those, so they can only belong to a REST call sharing the clause across a newline.
+  # SILENT-ON-DOUBT (the same advisory rule is_foreground_agent documents): a query document that is
+  # NOT on the command line (`-F query=@file.graphql`, `--input payload.json`, `-f query="$Q"`) cannot
+  # be classified, so it does not warn. A missing nudge is the whole cost; a wrong one on every
+  # file-backed read is the annoyance this rule was rewritten to remove.
+  # Known residual: a document that opens with a `fragment` definition or a `#` comment before its
+  # `mutation` keyword is not recognized (silent); a `query=` field value that is the literal text
+  # `mutation <word>` inside a READ (a search string) warns. Both advisory, both rare.
+  if printf '%s' "$c" | grep -Eq '(^|[[:space:]])api'"$_FLAGS"'[[:space:]]+graphql([[:space:]]|$)'; then
+    printf '%s' "$c" | grep -Eq -e '(query=["'\'']?[[:space:]]*|^[[:space:]]*)mutation([[:space:]]*[({]|[[:space:]]+[A-Za-z_]|[[:space:]]*$)' && return 0
+    printf '%s' "$c" | grep -Eq -e '(--method[[:space:]=]+|-X[[:space:]=]*)(PATCH|PUT|DELETE)' && return 0
+    return 1
+  fi
+  # REST: unchanged - an explicit method, or any field/input (gh then defaults to POST).
   printf '%s' "$c" | grep -Eq '(--method[[:space:]=]|-X[[:space:]=]?[A-Za-z])' && return 0
   printf '%s' "$c" | grep -Eq '(^|[[:space:]])(--(field|input|raw-field)[[:space:]=]|-[fF][[:space:]=]?[^[:space:]])' && return 0
+  return 1
+}
+
+# A raw `gh api` MUTATION on the command line, NOT routed through a gh-* wrapper, judged PER CLAUSE
+# (a clause here keeps embedded newlines; see _clauses). Within a clause: the `gh` word, the `api`
+# word, and then either (REST) a mutation flag -X/--method/-f/-F/--field/--raw-field/--input, or
+# (GraphQL, `gh api graphql`) a `mutation` operation in the query document - see
+# _is_api_mutation_clause. A wrapper-ALONE invocation (e.g. `gh-comment.sh 5 hi`) is silent because
+# the bare-`gh` check requires `gh` followed by space/EOL, and the char after `gh` in `gh-comment.sh`
+# is `-`; no global gh-*.sh exemption is needed (and one would be WRONG: in a compound
+# `gh-comment.sh ... && gh api -X PATCH ...` a bare `gh api` mutation IS present and must warn).
+# Separator-tolerant (space/=/glued), mirroring the guard's is_merge_api flag matching.
+is_raw_gh_api_mutation() {
+  local clause
+  while IFS= read -r -d $'\036' clause; do
+    _is_api_mutation_clause "$clause" && return 0
+  done < <(_clauses "$1")
   return 1
 }
 
@@ -261,17 +333,24 @@ is_raw_gh_api_mutation() {
 # so warning the allow-listed set buys nothing. We nudge ONLY the two subcommands with a canonical
 # target: `comment` (-> reply-comment.sh / gh-comment.sh) and `create` (-> /prep-pr). DELIBERATELY
 # EXCLUDES `merge` (floor-denied in a marker session, AND the sanctioned prompt-free path in solo -
-# a nag there is wrong), plus `edit`/`ready`/`close`/`review` and all reads (allow-listed lifecycle
-# or no canonical redirect). A wrapper-ALONE invocation (gh-comment.sh, reply-comment.sh) is already
-# silent: the bare-`gh` check needs `gh` + space/EOL and the char after `gh` in those names is `-`;
-# likewise `comment`/`create` inside a wrapper name is not space-delimited. ACCEPTED false-positive
-# (mirrors is_raw_gh_api_mutation's F30 class): a gh pr READ compounded with a standalone
-# `comment`/`create` word in an arg trips the whole-line grep - harmless (advisory WARN, exit 0).
+# a nag there is wrong), plus `edit`/`ready`/`close`/`review` and all reads.
+#
+# MATCHING: a real INVOCATION, per clause (&& || ; | and newlines split, continuations joined). The
+# clause must START with `gh` at command position - after optional _INTRO introducers, `VAR=val` env
+# prefixes, and a path (`/opt/homebrew/bin/gh`) - then optional GLOBAL flag groups (`-R o/r`), the
+# `pr` word, optional flag groups (`--repo o/r`), and `create`/`comment` as the NEXT non-flag word.
+# So a read is silent however the word appears elsewhere: `gh pr view 943 && echo create` (echo leads
+# its own clause), `gh pr view 5 --comments`, `gh pr list --search "create"` (`list` is the
+# subcommand), `gh pr view N ... | grep create`. A wrapper-ALONE invocation (reply-comment.sh,
+# gh-comment.sh) is silent: no clause starts with the bare word `gh`.
+# Known residual (advisory, rare): a quoted body containing `&&`/`;`/`|` followed by the literal text
+# `gh pr create` splits into a clause that looks like an invocation and warns.
 is_raw_gh_pr_mutation() {
-  local c="$1"
-  printf '%s' "$c" | grep -Eq '(^|[^[:alnum:]_-])gh([[:space:]]|$)' || return 1
-  printf '%s' "$c" | grep -Eq '(^|[[:space:]])pr([[:space:]]|$)' || return 1
-  printf '%s' "$c" | grep -Eq '(^|[[:space:]])(comment|create)([[:space:]]|$)' && return 0
+  local clause
+  while IFS= read -r -d $'\036' clause; do
+    printf '%s' "$clause" | grep -Eq '^[[:space:]]*'"$_INTRO"'([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*([^[:space:]]*/)?gh'"$_FLAGS"'[[:space:]]+pr'"$_FLAGS"'[[:space:]]+(create|comment)([[:space:]]|$)' \
+      && return 0
+  done < <(_clauses "$1" nl)
   return 1
 }
 
