@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Proof harness for orchestrate-steer.sh (the WARN-level steering hook, #95).
 
-Asserts the five advisory rules, through BOTH input channels (stdin JSON, $TOOL_INPUT env):
+Asserts all five advisory rules. The command/file rules (1)-(3) run through BOTH input channels
+(stdin JSON and $TOOL_INPUT env); rules (4) and (5) need stdin top-level fields (tool_name,
+session_id), so they run through stdin only.
   (1) MID-RUN CANONICAL EDIT (marker-gated): an Edit/Write of a canonical file (SKILL.md,
-      templates/*, orchestrate-guard.sh, orchestrate-steer.sh) WARNs only while THIS session's
-      marker is fresh; never blocks (exit 0). A non-canonical path, or a canonical path with no
-      active marker, is silent.
-  (2) RAW GH-API MUTATION -> WRAPPER (marker-independent): a `gh api` mutation on the command line
-      WARNs; a gh-* wrapper invocation, a read-only `gh api` GET, or a non-gh command is silent.
-Every case asserts exit 0 (steering NEVER blocks) and the presence/absence of the `STEER:` line.
+      templates/*, guard/steer, the deployed helpers, commands/*.md) WARNs only while THIS
+      session's marker is fresh. A non-canonical path, or no active marker, is silent.
+  (2) RAW GH-API MUTATION -> WRAPPER (marker-independent): a raw `gh api` REST mutation or GraphQL
+      `mutation` WARNs; a gh-* wrapper, a GET, a GraphQL read, or quoted prose is silent.
+  (3) RAW GH PR create/comment/new -> CANONICAL PATH: the word sequence anywhere in the command's
+      CODE (including $(...), backticks, `bash -c`/eval scripts and heredocs fed to a shell) WARNs;
+      reads and prose are silent.
+  (4) REDUNDANT RE-READ (per-session state) and (5) FOREGROUND AGENT (marker-gated).
+Plus the #287 advisory invariant (no nonzero exit, no stdout), robustness on malformed input, and
+scan-time bounds. Every case asserts exit 0 (steering NEVER blocks) and the `STEER:` line's
+presence/absence.
 Run: python3 test-orchestrate-steer.py
 """
 import importlib.util
@@ -42,7 +49,8 @@ def _self_key(tmux, ccsid):
 
 def run_steer(tool_input, *, channel, marker_active=False, tmux=DEFAULT_TMUX, ccsid=None,
               ttl_hours=24,
-              stale_self=False, tool_name="Bash", session_id=None, read_state_dir=None):
+              stale_self=False, tool_name="Bash", session_id=None, read_state_dir=None,
+              timeout=5):
     """Invoke the steer hook. Returns (exit_code, stderr). channel in {'stdin','env'}.
     tool_input is the dict passed as .tool_input (e.g. {'file_path': ...} or {'command': ...}).
     tool_name + session_id populate the stdin TOP-LEVEL fields (the env channel carries neither,
@@ -83,7 +91,7 @@ def run_steer(tool_input, *, channel, marker_active=False, tmux=DEFAULT_TMUX, cc
         elif channel == "env":
             env["TOOL_INPUT"] = json.dumps(tool_input)
         p = subprocess.run([STEER], input=stdin_data, env=env,
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stderr
 
 
@@ -321,7 +329,6 @@ def main():
         "sleep 1 & gh pr create --fill",                       # lone & separates
         "bash -c 'gh pr create --fill'",                       # a -c script is code, not prose
         "eval 'gh pr comment 5 -b hi'",
-        "gh pr\ncreate --fill",
         "gh pr view 5 --json x\ngh pr create --fill",          # newline-separated second command
         "(gh pr create --fill)",
         "command gh pr create --fill",
@@ -366,10 +373,103 @@ def main():
         # coreutils `pr` command): the pr-rule's flag tokens exclude ; & | ( )
         "gh --version -R o/r| pr create.txt",
         "gh -R o/r; pr comment.txt",
+        # M-3: an unescaped newline ends a command in bash, so `gh pr` NEWLINE `create` is two
+        # commands (`gh pr`, then a `create` command) - NOT a gh pr create invocation.
+        "gh pr\ncreate --fill",
     ]
     for c in SCAN_SILENT:
         rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
         check(f"scanner: read / prose -> silent ({c[:48]!r})", rc_ok and silent_all)
+
+    # ---- hostile-review round 3: every nested-code shape is scanned as code ------------------
+    # Each vector went SILENT at a7f6a9f (or is the one branch of the frame scanner that fixes it),
+    # pinned so a mutation of that branch goes red HERE, at its own assertion.
+    SCAN3_WARN = [
+        # I-1: the prefilter joins backslash-newline continuations BEFORE matching
+        "gh\\\n pr create --fill",
+        "gh pr\\\n  create --fill",
+        # I-2: a heredoc fed to a shell is CODE, not prose (bare, -s, <<-, quoted/unquoted delimiter)
+        "bash <<'EOF'\ngh pr create --fill\nEOF",
+        "bash -s <<EOF\ngh api -X DELETE repos/o/r/git/refs/heads/x\nEOF",
+        "sh <<-\"EOF\"\n\tgh pr comment 5 -b hi\n\tEOF",
+        "zsh <<EOF\necho hi\ngh pr create --fill\nEOF\necho done",
+        "cat <<'A' && bash <<'B'\nnot code: gh pr view 1\nA\ngh pr create --fill\nB",   # prose, then code
+        "echo $((1<<2))\ngh pr create --fill",                  # `<<` in arithmetic is no heredoc
+        "(( x = 1 << 2 )); gh pr create --fill",
+        # I-3: separators inside a -c / eval code quote split ITS clauses
+        "bash -c 'gh api graphql -f query=\"{viewer{login}}\"; gh api repos/o/r/issues/1/comments -f body=hi'",
+        "eval 'gh api graphql -f query=x; gh api repos/o/r/issues/1/comments -f body=y'",
+        "bash -c \"gh api graphql -f query='{a}' && gh api -X DELETE repos/o/r/x\"",
+        # I-4: a separator inside a nested $(...) / backtick never cuts the OUTER clause
+        "gh api repos/o/r/issues/$(gh pr view --json number -q .number | head -1)/comments -f body=x",
+        "gh api \"repos/$(git remote get-url origin | sed s/x/y/)/issues/1\" -X PATCH -f state=closed",
+        "gh api -X DELETE repos/o/r/git/refs/heads/$(gh api graphql -f query='{viewer{login}}' --jq .data.viewer.login)",
+        "gh api repos/o/r/issues/`gh api graphql -f query='{a}' --jq .n`/comments -f body=x",
+        # M-5: `gh pr new` (alias of create); long-option and ANSI-C -c scripts
+        "gh pr new --fill",
+        "bash --login -c 'gh pr create --fill'",
+        "bash -c $'gh pr create --fill'",
+        "bash -O extglob -c 'gh pr create --fill'",
+        # the query DOCUMENT (not a --jq filter) decides a GraphQL mutation
+        "gh api graphql --jq '.a' -f query='\nmutation {\n  x\n}'",
+        "gh api graphql -f query=mutation{x} --jq .",
+    ]
+    for c in SCAN3_WARN:
+        rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)
+        check(f"scanner r3: real mutation -> WARN, exit 0 ({c[:48]!r})", rc_ok and warned_all)
+
+    SCAN3_SILENT = [
+        # M-2: a double quote nested INSIDE a code quote is prose again
+        "bash -c 'echo \"then gh pr create\"'",
+        "bash -c \"echo \\\"then gh pr create\\\"\"",
+        "bash -c 'ls # then gh pr create'",
+        # M-2: a NEWLINE-led `mutation` in a --jq filter is not the query document
+        "gh api graphql -f query='{viewer{login}}' --jq '\nmutation (.)'",
+        "gh api graphql -f query='{viewer{login}}' --jq '.data\n| mutation'",
+        # a heredoc that is NOT fed to a shell stays prose
+        "cat > notes.md <<'EOF'\n... gh pr create ...\nEOF",
+        "bash script.sh <<EOF\ngh pr create --fill\nEOF",       # stdin of a script file, not code
+        "bash -c 'cat' <<EOF\ngh pr create --fill\nEOF",       # stdin of a -c script, not code
+        "cat <<'A'\ngh api -X DELETE x\nA\necho done",
+        # a command substitution's words stay inside it
+        "echo \"$(gh pr view 5)\" create",
+    ]
+    for c in SCAN3_SILENT:
+        rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
+        check(f"scanner r3: read / prose -> silent ({c[:48]!r})", rc_ok and silent_all)
+
+    # ROBUSTNESS: malformed / unbalanced / hostile input exits 0 promptly and never blocks.
+    ROBUST = [
+        "bash -c '", "bash -c \"x", "gh pr create $( $( $(", "gh pr create `", "cat <<EOF\n",
+        "bash <<EOF\n", "echo $((", "((", "\\", "'", "\"", "$'", "gh api \\", "<<", "<<-",
+        "eval \"'\"", "bash -c \"\\\"", "x\x01y gh pr view",
+    ]
+    for c in ROBUST:
+        try:
+            rc, _ = run_steer({"command": c}, channel="stdin")
+            ok = rc == 0
+        except subprocess.TimeoutExpired:
+            ok = False
+        check(f"robustness: unbalanced input exits 0 promptly ({c[:30]!r})", ok)
+    for raw in ("", "not json", "null", '{"tool_input":null}', '{"tool_input":{"command":null}}',
+                '{"tool_input":{"command":"gh pr create\\u0000 --fill"}}'):
+        p = subprocess.run([STEER], input=raw, capture_output=True, text=True, timeout=5)
+        check(f"robustness: malformed payload exits 0, no stdout ({raw[:30]!r})",
+              p.returncode == 0 and p.stdout == "")
+
+    # PERF (M-1): the scan is linear. 400KB of quoted words took 7.5s at a7f6a9f (quadratic tail).
+    for label, c, limit in (
+            ("400KB of 'a' words", "gh pr view 1 " + " ".join(["'a'"] * 100000) + " && echo create", 3.0),
+            ("50k $(a) substitutions", "gh pr view 1 " + "$(a) " * 50000 + "# create", 3.0),
+            ("100k-line heredoc", "cat > f <<'EOF'\n" + "line x\n" * 100000 + "EOF\ngh pr view 1 # create", 3.0)):
+        t0 = time.time()
+        try:
+            rc, err = run_steer({"command": c}, channel="stdin", timeout=30)
+            ok = rc == 0 and not warned(err)
+        except subprocess.TimeoutExpired:
+            ok = False
+        dt = time.time() - t0
+        check(f"perf: {label} scans in < {limit:.0f}s, silent ({dt:.2f}s)", ok and dt < limit)
 
     # PERF: a long read chain never reaches awk (the prefilter), and one that does (every clause
     # carries `comment`) is scanned in ONE pass, not one fork per clause.
