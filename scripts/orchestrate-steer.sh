@@ -27,15 +27,18 @@
 #   (2) RAW GH-API MUTATION -> WRAPPER: a shell clause (split quote-aware in EVERY code frame, see
 #       _steer_scan) invoking `gh api` NOT via a gh-* wrapper, with a REST mutation flag (-X/--method,
 #       -f/-F/--field/--raw-field/--input; same test as before 0.97.2) or, for `gh api graphql`, a
-#       query DOCUMENT that is a `mutation` operation (a GraphQL READ is silent; a --jq filter never
-#       counts; a document not on the line is silent-on-doubt) -> WARN: use the gh-* wrapper.
+#       query DOCUMENT on the line that is a `mutation` operation, or an explicit -X/--method
+#       PATCH|PUT|DELETE (which GraphQL never takes, so that is a mis-aimed REST mutation). A GraphQL
+#       READ is silent; a --jq filter never counts; with no document on the line and no such verb it
+#       is silent-on-doubt (-F query=@file, --input, -f query="$Q") -> WARN: use the gh-* wrapper.
 #       Marker-independent (steer every session).
 #   (3) RAW GH PR comment/create -> CANONICAL PATH: a `gh [flags] pr [flags] create|comment|new` word
 #       sequence anywhere in one clause of the command's CODE - the top level, $(...), backticks, a
 #       `sh|bash|... [opts] -c` / eval script, or a heredoc fed to a shell - so sudo/env/timeout/xargs
 #       shapes warn; quoted prose, comments, arithmetic and heredoc bodies not fed to a shell are
-#       masked -> WARN toward reply-comment.sh/gh-comment.sh / /prep-pr. Reads never warn. Unquoted
-#       echo prose (`echo next: gh pr create`) is an ACCEPTED false positive (see _steer_scan).
+#       masked -> WARN toward reply-comment.sh/gh-comment.sh / /prep-pr. A gh pr READ never warns on
+#       its own subcommand; the only way a read-only command warns is unquoted prose elsewhere on it
+#       (`echo next: gh pr create`), an ACCEPTED false positive (see _steer_scan). Quote it to silence.
 #       Marker-independent (#159).
 #   (4) REDUNDANT RE-READ -> WARN (#226): a 2nd+ `Read` of a path already read THIS session with an
 #       unchanged mtime+size -> WARN: the content is already in context, skip the Read. Stateful
@@ -305,17 +308,21 @@ _FLAGS='([[:space:]]+-[^[:space:]]+([[:space:]]+[^-[:space:]][^[:space:]]*)?)*'
 # PREFILTER (#perf): a no-fork bash test that a command COULD match rule 2 or 3. It must be a true
 # SUPERSET of what _steer_scan can flag. Rule 3 needs a `gh` word, a `pr` word and create|comment|new;
 # rule 2 needs `gh`, `api` and one of the mutation flags (a GraphQL mutation always carries its query
-# via -f/-F/--field/--raw-field, whose spellings all contain `-f`/`-F`). A backslash-newline can split
+# via -f/-F/--field/--raw-field, whose spellings all contain `-f`/`-F`). Each word test ends on any
+# non-word byte, NOT on whitespace: the scanner's own GH also accepts end-of-string, and heredoc()
+# rewrites a `<<WORD` to a space, so `gh api<<D graphql -f query=...` reads as `gh api graphql ...`
+# to the scanner while the raw bytes have `<` after `api`. Demanding whitespace there filtered out
+# commands the scanner DOES flag, inverting the containment. A backslash-newline can split
 # ANY of those words (`gh\<NL> pr`, `cre\<NL>ate`), and joining in bash (`${c//\\$'\n'/}`) is
 # super-linear on a long command, so a command carrying one skips the prefilter and goes straight to
 # the (linear) scanner, which joins it. Everything else costs what it did on base: no awk, no grep.
 _steer_prefilter() {
   local c="$1" re_gh re_pr re_sub re_api re_flag
   [[ $c == *\\$'\n'* ]] && return 0
-  re_gh='(^|[^[:alnum:]_-])gh[[:space:]]'
-  re_pr='(^|[^[:alnum:]_-])pr[[:space:]]'
+  re_gh='(^|[^[:alnum:]_-])gh([^[:alnum:]_-]|$)'
+  re_pr='(^|[^[:alnum:]_-])pr([^[:alnum:]_-]|$)'
   re_sub='(create|comment|new)'
-  re_api='(^|[[:space:]])api([[:space:]]|$)'
+  re_api='(^|[^[:alnum:]_-])api([^[:alnum:]_-]|$)'
   re_flag='(-[XfF]|--method|--input)'
   [[ $c =~ $re_gh ]] || return 1
   [[ $c =~ $re_pr && $c =~ $re_sub ]] && return 0
@@ -581,7 +588,12 @@ _steer_scan() {
           if (codeq()) cq("D", j + 1); else pq("D", j + 1)
           continue
         }
-        if (c == "$" && a[j + 1] == SQ) { if (codeq()) cq("E", j + 2); else pq("E", j + 2); j++; continue }
+        # !csq[d]: inside a single-quoted code script bash has no ANSI-C quote -- it ends the string
+        # at the next SQ, so that SQ is the script CLOSE, not the open of one. Without the guard this
+        # branch beats the SQ close above whenever a $ sits immediately before the closing quote (a
+        # trailing regex anchor is the common way that happens), eats that quote, and opens a frame
+        # that never closes -- silencing every clause after it. Vector: SQ_DOLLAR_WARN.
+        if (c == "$" && a[j + 1] == SQ && !csq[d]) { if (codeq()) cq("E", j + 2); else pq("E", j + 2); j++; continue }
         if (c == "$" && a[j + 1] == "(") {
           bapp(d, "X")
           if (a[j + 2] == "(") { push("A", 0, j + 3); j += 2 } else { push("P", 1, j + 2); j++ }

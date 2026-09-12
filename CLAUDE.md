@@ -74,9 +74,11 @@ Runtime (`scripts/`; canonical source is this repo):
   ONE linear-time, quote-aware awk scan in which every code frame - top level, `$(...)`, backticks, a
   `bash -c`/`eval` script, a heredoc fed to a shell - owns its own clauses, so a separator inside
   quotes never splits a call and a `|` inside `$(...)` never cuts the outer one; REST keeps the base
-  -X/-f/-F/--field/--input test; a `gh api graphql` call warns only when its query DOCUMENT is a
-  `mutation` operation (a `--jq` filter never counts), so GraphQL READS are silent, and a document not
-  on the line - `-F query=@file`, `--input`, `-f query="$Q"` - is silent-on-doubt);
+  -X/-f/-F/--field/--input test; a `gh api graphql` call warns when its query DOCUMENT on the line is
+  a `mutation` operation, or on an explicit `-X`/`--method PATCH|PUT|DELETE` (which GraphQL never
+  takes, so that is a mis-aimed REST mutation); a `--jq` filter never counts, so GraphQL READS are
+  silent, and with no document on the line and no such verb - `-F query=@file`, `--input`,
+  `-f query="$Q"` - it is silent-on-doubt);
   (3) a raw `gh pr comment`/`gh pr create` (or its alias `gh pr new`) -> canonical path
   (reply-comment.sh/gh-comment.sh; /prep-pr) (#159; canonical-steering only - `merge` and the
   allow-listed lifecycle subcommands are NOT flagged; matched as a `gh [flags] pr [flags]

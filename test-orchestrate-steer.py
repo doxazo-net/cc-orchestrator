@@ -431,6 +431,26 @@ def main():
         # a clause longer than one 256-byte buffer chunk keeps its early words (chunk join is exact)
         "gh pr create --title " + "t" * 300,
         "gh api repos/o/r/issues -f title=hi " + "x" * 600,
+        # SQ_DOLLAR_WARN: a `$` immediately before a code script's closing quote is NOT a $'...' open.
+        # Without the !csq[d] guard that branch ate the closing quote and opened a frame that never
+        # closed, silencing every clause after it -- a regression vs base, which warned on all three.
+        "bash -c 'grep x$' ; gh pr create --fill",
+        "eval 'echo $' ; gh pr comment 5 -b x",
+        "sh -c 'printf %s$' ; gh api repos/o/r/i -f a=b",
+        # the invariant the dead-csq removal RELIES ON: the main loop closes a single-quoted code
+        # script at its SQ, so a mutation AFTER a closed script is still judged. Every other -c/eval
+        # vector puts the invocation INSIDE the script, where the close need not be correct.
+        "bash -c 'echo hi' && gh pr create --fill",
+        "eval 'ls'; gh api -X PATCH repos/o/r/issues/1",
+        # `cat <<DELIM | bash` -- the whole SHALONE regex (sudo/command/exec prefixes) serves only
+        # this branch and had no vector; disabling it left the harness green.
+        "cat <<EOF | bash\ngh pr create --fill\nEOF",
+        "cat <<'EOF' | sudo bash\ngh api -X DELETE repos/o/r/x\nEOF",
+        # the prefilter ends a word on any non-word byte, not whitespace: heredoc() rewrites `<<D` to
+        # a space, so the scanner sees `gh api graphql` where the raw bytes have `<` after `api`.
+        "gh api<<D graphql -f query='mutation{x}'\nD",  # re_api
+        "gh pr<<D create --fill\nD",  # re_pr
+        "gh<<D api -X POST repos/o/r/i\nD",  # re_gh
     ]
     for c in SCAN3_WARN:
         rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)
