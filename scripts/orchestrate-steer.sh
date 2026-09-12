@@ -413,11 +413,12 @@ _steer_scan() {
       tl = (j > 6 && a[j - 1] == "=" && a[j - 6] == "q") ? a[j-6] a[j-5] a[j-4] a[j-3] a[j-2] "=" : ""
       dk[d] = p; dq[d] = (tl == "query=" ? 0 : 1)
     }
-    # FAST PATH for the common prose single quote: no enclosing code quote (a SQ could end it), not a
-    # possible query= value (a `=` before it, or content starting with `q`): skip to the closing quote
-    # without a frame. Bounded by the enclosing shell-fed heredoc body; unbalanced -> the slow path.
+    # FAST PATH for the common prose single quote: not inside a code "..." (whose `"` must still close
+    # it), not a possible query= value (a `=` before it, or content starting with `q`): skip to the
+    # closing quote without a frame. (Inside a single-quoted code script a quote never reaches here: the main loop
+    # closes the script first.) Bounded by the enclosing shell-fed heredoc body; unbalanced -> slow path.
     function sqprose(   k, lim) {
-      if (csq[d] || qd[d] || a[j - 1] == "=" || a[j + 1] == "q") { pq("S", j + 1); return }
+      if (qd[d] || a[j - 1] == "=" || a[j + 1] == "q") { pq("S", j + 1); return }
       lim = (HD ? HE : n + 1)
       k = j + 1; while (k < lim && a[k] != SQ) k++
       if (k >= lim) { pq("S", j + 1); return }

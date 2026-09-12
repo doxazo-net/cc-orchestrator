@@ -90,8 +90,11 @@ def run_steer(tool_input, *, channel, marker_active=False, tmux=DEFAULT_TMUX, cc
             stdin_data = json.dumps(payload)
         elif channel == "env":
             env["TOOL_INPUT"] = json.dumps(tool_input)
-        p = subprocess.run([STEER], input=stdin_data, env=env,
-                           capture_output=True, text=True, timeout=timeout)
+        try:
+            p = subprocess.run([STEER], input=stdin_data, env=env,
+                               capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return 124, "TIMEOUT (the hook hung; it must never block a tool call)"
         return p.returncode, p.stderr
 
 
@@ -413,6 +416,21 @@ def main():
         # the query DOCUMENT (not a --jq filter) decides a GraphQL mutation
         "gh api graphql --jq '.a' -f query='\nmutation {\n  x\n}'",
         "gh api graphql -f query=mutation{x} --jq .",
+        # a <<- body's delimiter line is TAB-indented; without the strip the body swallows what follows
+        "cat <<-EOF\n\tx\n\tEOF\ngh pr create --fill",
+        # ((...)) arithmetic: its `<<` is a shift, so the next line is a command, not a heredoc body
+        "(( x = 1 << 2 ))\ngh pr create --fill",
+        # a $(...) placeholder keeps a glued flag value a value: `-f$(cat body)` is a field
+        "gh api repos/o/r/issues -f$(cat body)",
+        # a shell-fed heredoc body ends at its delimiter even with an unbalanced quote inside it
+        "bash <<EOF\necho 'x\nEOF\ngh pr create --title 'y'",
+        # inside a code "...", a ' is literal to bash's parse of the OUTER quote: `"` still closes it
+        "bash -c \"echo it's\" && gh pr create --title 'x'",
+        # a shell-fed heredoc must never hang the scan (it is judged, then closed at its delimiter)
+        "bash <<'EOF'\necho hi\nEOF\ngh pr create --fill",
+        # a clause longer than one 256-byte buffer chunk keeps its early words (chunk join is exact)
+        "gh pr create --title " + "t" * 300,
+        "gh api repos/o/r/issues -f title=hi " + "x" * 600,
     ]
     for c in SCAN3_WARN:
         rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)
@@ -433,6 +451,11 @@ def main():
         "cat <<'A'\ngh api -X DELETE x\nA\necho done",
         # a command substitution's words stay inside it
         "echo \"$(gh pr view 5)\" create",
+        # each nested frame starts with an EMPTY clause: a sibling's words never leak into the next
+        "echo $(gh api repos/o/r/pulls) $(echo -f x)",
+        # only the query= value is the document: another field's value beginning `mutation` is data
+        "gh api graphql -f query='query($q:String!){search(query:$q,type:ISSUE,first:1){issueCount}}' -f q='mutation testing'",
+        "gh api graphql -f query='{viewer{login}}' -f note='\nmutation x'",
     ]
     for c in SCAN3_SILENT:
         rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
